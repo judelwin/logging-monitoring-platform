@@ -18,6 +18,12 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
         format_sql: true
+        jdbc:
+          batch_size: 50
+          order_inserts: true
+          order_updates: true
+        batch:
+          versioned_data: true
     show-sql: false
 
 server:

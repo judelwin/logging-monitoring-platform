@@ -13,7 +13,6 @@ import java.time.Instant;
  */
 @Entity
 @Table(name = "logs", indexes = {
-    @Index(name = "idx_ts_desc", columnList = "ts DESC"),
     @Index(name = "idx_app", columnList = "app"),
     @Index(name = "idx_level", columnList = "level")
 })

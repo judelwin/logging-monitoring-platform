@@ -11,15 +11,18 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StreamOperations;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Consumes log messages from Redis Streams using consumer groups.
- * Implements ack-on-write: messages are acknowledged only after successful database persistence.
- * Handles pending messages on restart by processing unacknowledged entries.
+ * Implements batch inserts and ack-on-write: messages are acknowledged only after successful database persistence.
+ * Handles backpressure by pausing consumption when database operations queue up.
  */
 @Slf4j
 @Service
@@ -29,13 +32,18 @@ public class StreamConsumerService {
     private static final String STREAM_NAME = "logs:stream";
     private static final String CONSUMER_GROUP = "log-processors";
     private static final String CONSUMER_NAME = "processor-1";
-    private static final int BATCH_SIZE = 10;
+    private static final int BATCH_SIZE = 50;
+    private static final int MAX_PENDING_BATCHES = 3;
+    private static final int BACKPRESSURE_THRESHOLD = MAX_PENDING_BATCHES * BATCH_SIZE;
     
     private final RedisTemplate<String, Object> redisTemplate;
     private final LogRepository logRepository;
     private final ObjectMapper objectMapper;
     
-    @Scheduled(fixedDelay = 1000)
+    // Track pending database operations for backpressure handling
+    private final AtomicInteger pendingDbOperations = new AtomicInteger(0);
+    
+    @Scheduled(fixedDelay = 500)
     public void processStream() {
         try {
             StreamOperations<String, Object, Object> streamOps = redisTemplate.opsForStream();
@@ -43,10 +51,17 @@ public class StreamConsumerService {
             // Ensure consumer group exists
             ensureConsumerGroup(streamOps);
             
+            // Check backpressure - pause consumption if database is overloaded
+            if (pendingDbOperations.get() >= BACKPRESSURE_THRESHOLD) {
+                log.warn("Backpressure: {} pending DB operations, pausing stream consumption", 
+                    pendingDbOperations.get());
+                return;
+            }
+            
             // Process pending messages first (retry on restart)
             processPendingMessages(streamOps);
             
-            // Process new messages
+            // Process new messages in batches
             processNewMessages(streamOps);
             
         } catch (Exception e) {
@@ -84,10 +99,9 @@ public class StreamConsumerService {
                 return;
             }
             
-            // Process each pending message
-            for (MapRecord<String, Object, Object> record : pendingRecords) {
-                processMessage(record.getId(), record.getValue(), streamOps);
-            }
+            // Process pending messages in batch
+            processBatch(pendingRecords, streamOps);
+            
         } catch (Exception e) {
             // Ignore if no pending messages or stream doesn't exist yet
             if (!e.getMessage().contains("NOGROUP") && !e.getMessage().contains("no such key")) {
@@ -104,9 +118,13 @@ public class StreamConsumerService {
                 StreamOffset.create(STREAM_NAME, ReadOffset.lastConsumed())
             );
             
-            for (MapRecord<String, Object, Object> record : records) {
-                processMessage(record.getId(), record.getValue(), streamOps);
+            if (records == null || records.isEmpty()) {
+                return;
             }
+            
+            // Process new messages in batch
+            processBatch(records, streamOps);
+            
         } catch (Exception e) {
             if (!e.getMessage().contains("NOGROUP")) {
                 log.error("Error reading new messages", e);
@@ -114,24 +132,61 @@ public class StreamConsumerService {
         }
     }
     
-    private void processMessage(RecordId recordId, Map<Object, Object> values, StreamOperations<String, Object, Object> streamOps) {
+    /**
+     * Processes a batch of messages: converts to entities, saves to database in batch,
+     * then acknowledges all messages after successful write (ack-on-write).
+     */
+    @Transactional
+    private void processBatch(List<MapRecord<String, Object, Object>> records, 
+                             StreamOperations<String, Object, Object> streamOps) {
+        if (records.isEmpty()) {
+            return;
+        }
+        
+        pendingDbOperations.addAndGet(records.size());
+        
         try {
-            // Extract JSON payload from stream values
-            String jsonPayload = extractJsonPayload(values);
-            LogMessage logMessage = objectMapper.readValue(jsonPayload, LogMessage.class);
+            List<LogEntity> entities = new ArrayList<>();
+            List<RecordId> recordIds = new ArrayList<>();
             
-            // Persist to database
-            LogEntity logEntity = convertToEntity(logMessage);
-            logRepository.save(logEntity);
+            // Convert all messages to entities
+            for (MapRecord<String, Object, Object> record : records) {
+                try {
+                    String jsonPayload = extractJsonPayload(record.getValue());
+                    LogMessage logMessage = objectMapper.readValue(jsonPayload, LogMessage.class);
+                    LogEntity entity = convertToEntity(logMessage);
+                    entities.add(entity);
+                    recordIds.add(record.getId());
+                } catch (Exception e) {
+                    log.error("Failed to convert message {}", record.getId(), e);
+                    // Skip this message but continue with batch
+                }
+            }
             
-            // Acknowledge only after successful write (ack-on-write)
-            streamOps.acknowledge(STREAM_NAME, CONSUMER_GROUP, recordId);
+            if (entities.isEmpty()) {
+                pendingDbOperations.addAndGet(-records.size());
+                return;
+            }
             
-            log.debug("Processed and acknowledged message: {}", recordId);
+            // Batch insert to database
+            logRepository.saveAll(entities);
+            
+            // Acknowledge all messages after successful batch write (ack-on-write)
+            for (RecordId recordId : recordIds) {
+                try {
+                    streamOps.acknowledge(STREAM_NAME, CONSUMER_GROUP, recordId);
+                } catch (Exception e) {
+                    log.error("Failed to acknowledge message {}", recordId, e);
+                }
+            }
+            
+            log.debug("Processed and acknowledged batch of {} messages", entities.size());
             
         } catch (Exception e) {
-            log.error("Failed to process message {}", recordId, e);
-            // Message remains unacknowledged and will be retried
+            log.error("Failed to process batch of {} messages", records.size(), e);
+            // Messages remain unacknowledged and will be retried
+        } finally {
+            pendingDbOperations.addAndGet(-records.size());
         }
     }
     
@@ -168,4 +223,3 @@ public class StreamConsumerService {
         return entity;
     }
 }
-
