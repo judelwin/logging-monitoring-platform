@@ -4,7 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.logging.processor.model.LogEntity;
 import com.logging.processor.model.LogMessage;
 import com.logging.processor.repository.LogRepository;
-import lombok.RequiredArgsConstructor;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -22,11 +24,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Consumes log messages from Redis Streams using consumer groups.
  * Implements batch inserts and ack-on-write: messages are acknowledged only after successful database persistence.
- * Handles backpressure by pausing consumption when database operations queue up.
+ * Tracks metrics for processing rate, DB write latency, and batch processing.
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class StreamConsumerService {
     
     private static final String STREAM_NAME = "logs:stream";
@@ -40,8 +41,35 @@ public class StreamConsumerService {
     private final LogRepository logRepository;
     private final ObjectMapper objectMapper;
     
+    // Metrics
+    private final Counter logsProcessedCounter;
+    private final Counter batchesProcessedCounter;
+    private final Timer dbWriteLatencyTimer;
+    
     // Track pending database operations for backpressure handling
     private final AtomicInteger pendingDbOperations = new AtomicInteger(0);
+    
+    public StreamConsumerService(RedisTemplate<String, Object> redisTemplate,
+                                 LogRepository logRepository,
+                                 ObjectMapper objectMapper,
+                                 MeterRegistry meterRegistry) {
+        this.redisTemplate = redisTemplate;
+        this.logRepository = logRepository;
+        this.objectMapper = objectMapper;
+        
+        this.logsProcessedCounter = Counter.builder("logs.processed")
+            .description("Total number of log messages processed and persisted")
+            .tag("consumer_group", CONSUMER_GROUP)
+            .register(meterRegistry);
+        this.batchesProcessedCounter = Counter.builder("logs.batches.processed")
+            .description("Total number of batches processed")
+            .tag("consumer_group", CONSUMER_GROUP)
+            .register(meterRegistry);
+        this.dbWriteLatencyTimer = Timer.builder("logs.db.write.latency")
+            .description("Time taken to write log batches to database")
+            .tag("consumer_group", CONSUMER_GROUP)
+            .register(meterRegistry);
+    }
     
     @Scheduled(fixedDelay = 500)
     public void processStream() {
@@ -168,8 +196,14 @@ public class StreamConsumerService {
                 return;
             }
             
-            // Batch insert to database
-            logRepository.saveAll(entities);
+            // Batch insert to database with latency tracking
+            dbWriteLatencyTimer.record(() -> {
+                logRepository.saveAll(entities);
+            });
+            
+            // Update metrics
+            logsProcessedCounter.increment(entities.size());
+            batchesProcessedCounter.increment();
             
             // Acknowledge all messages after successful batch write (ack-on-write)
             for (RecordId recordId : recordIds) {
