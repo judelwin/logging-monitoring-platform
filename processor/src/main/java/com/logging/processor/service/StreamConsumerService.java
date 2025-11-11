@@ -5,6 +5,7 @@ import com.logging.processor.model.LogEntity;
 import com.logging.processor.model.LogMessage;
 import com.logging.processor.repository.LogRepository;
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import lombok.extern.slf4j.Slf4j;
@@ -45,6 +46,7 @@ public class StreamConsumerService {
     private final Counter logsProcessedCounter;
     private final Counter batchesProcessedCounter;
     private final Timer dbWriteLatencyTimer;
+    private final AtomicInteger streamLagGauge;
     
     // Track pending database operations for backpressure handling
     private final AtomicInteger pendingDbOperations = new AtomicInteger(0);
@@ -68,6 +70,14 @@ public class StreamConsumerService {
         this.dbWriteLatencyTimer = Timer.builder("logs.db.write.latency")
             .description("Time taken to write log batches to database")
             .tag("consumer_group", CONSUMER_GROUP)
+            .register(meterRegistry);
+        
+        // Stream lag gauge - tracks pending messages in consumer group
+        this.streamLagGauge = new AtomicInteger(0);
+        Gauge.builder("logs.stream.lag", streamLagGauge, AtomicInteger::get)
+            .description("Number of pending messages in Redis Stream consumer group")
+            .tag("consumer_group", CONSUMER_GROUP)
+            .tag("consumer", CONSUMER_NAME)
             .register(meterRegistry);
     }
     
@@ -110,11 +120,16 @@ public class StreamConsumerService {
     private void processPendingMessages(StreamOperations<String, Object, Object> streamOps) {
         try {
             PendingMessagesSummary pending = streamOps.pending(STREAM_NAME, CONSUMER_GROUP);
-            if (pending.getTotalPendingMessages() == 0) {
+            int totalPending = pending.getTotalPendingMessages();
+            
+            // Update stream lag gauge
+            streamLagGauge.set(totalPending);
+            
+            if (totalPending == 0) {
                 return;
             }
             
-            log.info("Processing {} pending messages", pending.getTotalPendingMessages());
+            log.info("Processing {} pending messages", totalPending);
             
             // Read pending messages for this consumer
             List<MapRecord<String, Object, Object>> pendingRecords = streamOps.read(
@@ -140,6 +155,14 @@ public class StreamConsumerService {
     
     private void processNewMessages(StreamOperations<String, Object, Object> streamOps) {
         try {
+            // Update stream lag before reading
+            try {
+                PendingMessagesSummary pending = streamOps.pending(STREAM_NAME, CONSUMER_GROUP);
+                streamLagGauge.set(pending.getTotalPendingMessages());
+            } catch (Exception e) {
+                // Ignore if stream doesn't exist yet
+            }
+            
             List<MapRecord<String, Object, Object>> records = streamOps.read(
                 Consumer.from(CONSUMER_GROUP, CONSUMER_NAME),
                 StreamReadOptions.empty().count(BATCH_SIZE),
