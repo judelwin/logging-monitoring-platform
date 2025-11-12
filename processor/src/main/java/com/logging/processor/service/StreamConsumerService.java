@@ -47,9 +47,12 @@ public class StreamConsumerService {
     private final Counter batchesProcessedCounter;
     private final Timer dbWriteLatencyTimer;
     private final AtomicInteger streamLagGauge;
+    private final Counter recoveryCounter;
+    private final Timer recoveryTimeTimer;
     
     // Track pending database operations for backpressure handling
     private final AtomicInteger pendingDbOperations = new AtomicInteger(0);
+    private volatile long recoveryStartTime = 0;
     
     public StreamConsumerService(RedisTemplate<String, Object> redisTemplate,
                                  LogRepository logRepository,
@@ -78,6 +81,16 @@ public class StreamConsumerService {
             .description("Number of pending messages in Redis Stream consumer group")
             .tag("consumer_group", CONSUMER_GROUP)
             .tag("consumer", CONSUMER_NAME)
+            .register(meterRegistry);
+        
+        // Recovery metrics
+        this.recoveryCounter = Counter.builder("logs.recovery.count")
+            .description("Number of recovery operations (processor restarts with pending messages)")
+            .tag("consumer_group", CONSUMER_GROUP)
+            .register(meterRegistry);
+        this.recoveryTimeTimer = Timer.builder("logs.recovery.time")
+            .description("Time taken to recover and process all pending messages after restart")
+            .tag("consumer_group", CONSUMER_GROUP)
             .register(meterRegistry);
     }
     
@@ -126,7 +139,21 @@ public class StreamConsumerService {
             streamLagGauge.set(totalPending);
             
             if (totalPending == 0) {
+                // Recovery complete if we had started recovery
+                if (recoveryStartTime > 0) {
+                    long recoveryTime = System.currentTimeMillis() - recoveryStartTime;
+                    recoveryTimeTimer.record(recoveryTime, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    log.info("Recovery complete in {} ms", recoveryTime);
+                    recoveryStartTime = 0;
+                }
                 return;
+            }
+            
+            // Start recovery timer if this is the first time we see pending messages
+            if (recoveryStartTime == 0 && totalPending > 0) {
+                recoveryStartTime = System.currentTimeMillis();
+                recoveryCounter.increment();
+                log.info("Recovery started: {} pending messages detected", totalPending);
             }
             
             log.info("Processing {} pending messages", totalPending);

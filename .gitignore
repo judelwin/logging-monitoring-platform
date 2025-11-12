@@ -27,3 +27,4 @@ Thumbs.db
 # Ignore all markdown files except README.md
 *.md
 !README.md
+!FAULT_RECOVERY.md
