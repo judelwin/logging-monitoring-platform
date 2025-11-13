@@ -16,6 +16,7 @@ node_modules/
 
 # Generated data and benchmarks
 benchmarks/*.csv
+!benchmarks/README.md
 logs/
 __pycache__/
 *.class

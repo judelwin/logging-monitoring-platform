@@ -66,6 +66,8 @@ services:
     build:
       context: ./producer
       dockerfile: Dockerfile
+    # Note: Remove container_name to allow scaling with: docker compose up -d --scale producer=3
+    # For single instance, uncomment container_name line below
     container_name: producer
     ports:
       - "8080:8080"
